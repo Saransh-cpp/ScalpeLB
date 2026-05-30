@@ -1,0 +1,9 @@
+[project]
+name = "scalpelb"
+version = "0.1.0"
+description = "Inertial Local-Search Load Balancing of MoEs on GPUs"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.4.6",
+]
