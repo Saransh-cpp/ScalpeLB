@@ -18,8 +18,9 @@ Instead of recomputing the whole layout every cycle (and paying that transit eve
 cycle), ScalpeLB establishes a good variance-aware placement ONCE, and then
 _maintains_ it with a small bounded number of surgical swaps per layer.
 
-- Cycle 1: variance-aware placement (mean + K\*std replication + balanced packing),
-  aligned to the seed -> one-time placement cost.
+- Cycle 1: variance-aware placement (mean + K\*std replication + balanced packing,
+  recency-weighted on layers whose traffic regime shifts mid-window), aligned to the
+  seed -> one-time placement cost.
 - Cycle 2+ (per layer): try cheap bounded swap-maintenance (relocate hottest expert
   off the hottest GPU onto the coldest GPU, <= BUDGET swaps). Keep it only if its
   PAR stays within DRIFT_TOL of a fresh variance placement; otherwise the layer
@@ -40,14 +41,15 @@ scratch; every cycle after that tries to _keep_ that placement and only repairs 
 layers that have gone stale. Each numbered step below maps to a function in
 [scalpelb.py](scalpelb.py).
 
-#### Step 0: Variance-aware weight (`step`)
+#### Step 0: Variance-aware planning weight (`_placement_weight`)
 
 The input `hotness` is a rolling window of per-expert traffic, shape
 `[window, n_layers, n_experts]`. Two summaries are derived from it:
 
-- `weight = mean(window) + K * std(window)`: the **planning** signal. Adding
-  `K * std` over-provisions experts whose load is _spiky_, not just high on average,
-  so a bursty expert gets extra replicas before it melts a GPU.
+- `weight`: the **planning** signal that drives placement. By default it is
+  `mean(window) + K * std(window)` — adding `K * std` over-provisions experts whose
+  load is _spiky_, not just high on average, so a bursty expert gets extra replicas
+  before it melts a GPU. (Refined per-layer by shift-gated recency, below.)
 - `real = sum(window)`: the **measurement** signal (raw observed load), used only
   to score placements in the drift check so the guard reacts to what actually
   happened, not to the hedged estimate.
@@ -56,6 +58,19 @@ The input `hotness` is a rolling window of per-expert traffic, shape
 (`K = 2.0` for `n_experts >= 192`, e.g. DeepSeek-R1's 256) but hurts low-count,
 more-uniform models (`K = 0.0` for Qwen3-style 128), where it scored worse than
 plain mean.
+
+**Shift-gated recency.** A uniform `mean` over the window lags at a context flip:
+when the traffic regime changes mid-window (the "Mix" trace), a newly-hot expert is
+diluted by the stale early steps, ends up under-provisioned, and PAR explodes. To
+catch this per layer, the window is split into halves and the **Total-Variation
+distance** between the two halves' _normalized_ load distributions is measured
+(`tv = 0.5 * Σ|new − old|`, in `[0, 1]`). TV is volume-invariant, so ordinary
+stationary jitter doesn't trip it (measured ceiling ≈ 0.143). On the layers where
+`tv > SHIFT_TV`, the planning weight switches to a **linear recency ramp** — a
+time-weighted mean + `K`·(weighted std) that leans on the most recent steps — so the
+new regime is provisioned immediately. Layers that haven't shifted (and the entire
+stationary case) keep the exact uniform `mean + K*std`, so the refinement is zero-cost
+when nothing has changed.
 
 #### Step 1: One-time global placement (cycle 1 only)
 
@@ -104,33 +119,37 @@ anything throws, so a single bad cycle can never crash the serving loop.
 
 ### Parameters
 
-ScalpeLB has four knobs. Each trades off the two competing objectives - **PAR**
+ScalpeLB has five knobs, all balancing the two competing objectives - **PAR**
 (balance quality) against **Transit** (experts moved). The defaults below were found
 by an offline grid sweep over the competition traces (the value in each grid cell
 scored by PAR and transit), so they are the best static operating point for _those_
 traces; the next section covers how a production system would set them dynamically
 instead.
 
-| Parameter    | What it controls                                                                                            | Default          | Turn it **up** when…                                           | Turn it **down** when…                                          |
-| ------------ | ----------------------------------------------------------------------------------------------------------- | ---------------- | -------------------------------------------------------------- | --------------------------------------------------------------- |
-| `K`          | Variance buffer in the planning weight `mean + K*std`; controls how aggressively spiky experts are over-replicated. | auto (2.0 / 0.0) | Traffic is bursty/chaotic and you have spare replica slots.    | Traffic is smooth/uniform, or redundant slots are scarce.       |
-| `BUDGET`     | Max swaps per layer per cycle; the hard ceiling on transit.                                                | 8                | Interconnect is idle; you want the tightest possible balance.  | Interconnect is congested; minimize experts in flight.          |
-| `DRIFT_TOL`  | How far a maintained layer's PAR may exceed a fresh placement's before it's re-placed.                      | 0.2              | You favor stability/low transit over chasing every PAR gain.   | You need PAR held tight and can afford the extra re-placements. |
-| `HEAVY_FRAC` | Fraction of drifted layers that triggers a full re-place of every layer that cycle.                         | 0.5              | Drift is usually localized; keep patching as long as possible. | Traffic shifts globally; bail to a full rebuild sooner.         |
+| Parameter    | What it controls                                                                                                         | Default          | Turn it **up** when…                                                   | Turn it **down** when…                                                     |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------ | ---------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `K`          | Variance buffer in the planning weight `mean + K*std`; controls how aggressively spiky experts are over-replicated.      | auto (2.0 / 0.0) | Traffic is bursty/chaotic and you have spare replica slots.            | Traffic is smooth/uniform, or redundant slots are scarce.                  |
+| `SHIFT_TV`   | TV-distance threshold for detecting a within-window load-distribution shift; gates the recency-weighted planning weight. | 0.2              | Only dramatic regime flips should trigger recency; ignore minor drift. | You want to react to subtler within-window shifts (risk: firing on noise). |
+| `BUDGET`     | Max swaps per layer per cycle; the hard ceiling on transit.                                                              | 8                | Interconnect is idle; you want the tightest possible balance.          | Interconnect is congested; minimize experts in flight.                     |
+| `DRIFT_TOL`  | How far a maintained layer's PAR may exceed a fresh placement's before it's re-placed.                                   | 0.2              | You favor stability/low transit over chasing every PAR gain.           | You need PAR held tight and can afford the extra re-placements.            |
+| `HEAVY_FRAC` | Fraction of drifted layers that triggers a full re-place of every layer that cycle.                                      | 0.5              | Drift is usually localized; keep patching as long as possible.         | Traffic shifts globally; bail to a full rebuild sooner.                    |
 
 `K` is auto-selected from `n_experts` (`K_HIGH = 2.0` at or above `K_SWITCH_NE = 192`,
 `K_LOW = 0.0` below) unless passed explicitly to `ScalpelBalancer`. `BUDGET` converges
 early in practice (~2 swaps); the default of 8 just leaves headroom for drift cycles.
+`SHIFT_TV = 0.2` sits just above the measured stationary TV ceiling (~0.143), so it is
+provably silent on stationary traces and fires only on genuine regime flips; set it
+above 1 to disable shift-gated recency entirely.
 
 ### Tuning in production
 
-These four constants are deliberately exposed as `ScalpelBalancer` constructor
+These five constants are deliberately exposed as `ScalpelBalancer` constructor
 arguments rather than buried in the algorithm. In a live hyperscale system (the kind
 of infrastructure serving DeepSeek-R1 or GPT-4) they would **not** be static. They
 are exactly the surface a telemetry-driven control plane tunes online. ScalpeLB
 already ships a primitive version of this: `K` is auto-selected from the model's
-expert count. A full controller would go further, recomputing the knobs per window
-from live signals:
+expert count, and `SHIFT_TV` already reacts to live regime shifts per layer. A full
+controller would go further, recomputing the knobs per window from live signals:
 
 - **Dynamic `K` (variance buffer).** A background service watches the burstiness of
   the last few minutes of routing traffic (the same `hotness` stream the balancer
@@ -178,14 +197,16 @@ success, layer_indices, placement, _ = rebalance(
 
 ## Future work
 
-The four knobs are currently set by an **offline grid sweep** over the competition
-traces, which was exhaustive, static, and tied to the traces it was run on. The "Tuning in
-production" section above describes the first step beyond that: a control plane that
-sets the knobs from live telemetry instead of a frozen sweep result. The natural next
-step is to make that loop **learned** rather than hand-engineered: instead of either a
-grid sweep or hand-written telemetry → knob rules, train a small controller (telemetry
-features → `K`, `BUDGET`, `DRIFT_TOL`, `HEAVY_FRAC`) by gradient descent on a
-`PAR + λ * Transit` objective measured over incoming traffic.
+The knobs are currently set by an **offline grid sweep** over the competition
+traces, which was exhaustive, static, and tied to the traces it was run on (`SHIFT_TV`
+is the exception — it is pinned just above the measured stationary noise floor rather
+than swept). The "Tuning in production" section above describes the first step beyond
+that: a control plane that sets the knobs from live telemetry instead of a frozen sweep
+result. The natural next step is to make that loop **learned** rather than
+hand-engineered: instead of either a grid sweep or hand-written telemetry → knob rules,
+train a small controller (telemetry features → `K`, `SHIFT_TV`, `BUDGET`, `DRIFT_TOL`,
+`HEAVY_FRAC`) by gradient descent on a `PAR + λ * Transit` objective measured over
+incoming traffic.
 
 The obstacle is that the current pipeline is **non-differentiable**; hence, replication,
 balanced packing, and the scalpel swaps are all built from `argmax` / `argsort` /
