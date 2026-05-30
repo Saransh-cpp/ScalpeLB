@@ -88,8 +88,8 @@ catch this per layer, the window is split into halves and the **Total-Variation
 distance** between the two halves' _normalized_ load distributions is measured
 (`tv = 0.5 * Σ|new − old|`, in `[0, 1]`). TV is volume-invariant, so ordinary
 stationary jitter doesn't trip it (measured ceiling ≈ 0.143). On the layers where
-`tv > SHIFT_TV`, the planning weight switches to a **linear recency ramp** — a
-time-weighted mean + `K`·(weighted std) that leans on the most recent steps — so the
+`tv > SHIFT_TV`, the planning weight switches to a **linear recency ramp**; a
+time-weighted mean + `K`·(weighted std) that leans on the most recent steps, so the
 new regime is provisioned immediately. Layers that haven't shifted (and the entire
 stationary case) keep the exact uniform `mean + K*std`, so the refinement is zero-cost
 when nothing has changed.
