@@ -4,9 +4,10 @@ Inertial Local-Search Load Balancing of MoEs on GPUs.
 
 Built for
 [MOE Dynamic Load Balancing Competition](https://www.codabench.org/competitions/16778/#/pages-tab)
-by [LauzHack](https://lauzhack.com/2026-huawei/info) and Huawei.
+by [LauzHack](https://lauzhack.com/2026-huawei/info) and
+[Huawei](https://moe-competition-docs.readthedocs.io).
 
-## Algorithm
+## Introduction
 
 Builds on top of (and improves) [DeepSeek's EPLB](https://github.com/deepseek-ai/EPLB)
 algorithm to optimize the placement of experts on GPUs in terms of:
@@ -34,14 +35,35 @@ up PAR on non-stationary / mixed traces (a newly-hot expert can't get more copie
 per-layer re-place fixes that while keeping low transit on the stable majority. Swaps and
 re-placement both preserve coverage -> no NaN-PAR risk.
 
-### The algorithm, step by step
+## Results
+
+ScalpeLB achieves a mean PAR of 1.71 with 638465 total transits on a hidden test set
+composed of real-world MoE traces from multiple frontier models - ShareGPT (Qwen3),
+ShareGPT (DeepSeek R1), LmSys(Qwen3), LmSys (DeepSeek R1), WildChat (Qwen3), WildChat
+(DeepSeek R1), Mix (DeepSeek R1) - collected by Huawei. Furthermore, the algorithm
+achieved a
+[composite score](https://moe-competition-docs.readthedocs.io/en/latest/competition-context.html#composite-score)
+of 110.94 (beating DeepSeek EPLB's composite score - 100).
+
+The algorithm was placed 8th (out of 41 participants and 26 submissions) on a
+[very tight final leaderboard](https://www.codabench.org/competitions/16778/#/results-tab):
+
+<img width="1165" height="606" alt="image" src="https://github.com/user-attachments/assets/9aaba33e-6f9e-4eb8-a7bd-fabbb46b216d" />
+
+Moreover, ScalpeLB's variance-hedged inertia natively excels on highly-skewed,
+stationary traffic (e.g., LmSys (DeepSeek R1)). It inherently struggles on uniform-load
+architectures (e.g., Qwen3, where variance hedging over-provisions) and on violent
+context-switching traces (e.g., Mix (DeepSeek R1), where layout inertia becomes a
+liability), requiring dynamic fallbacks to plain-sum global repacking.
+
+## Algorithm
 
 The state machine runs once per routing cycle. Cycle 1 builds a placement from
 scratch; every cycle after that tries to _keep_ that placement and only repairs the
 layers that have gone stale. Each numbered step below maps to a function in
 [scalpelb.py](scalpelb.py).
 
-#### Step 0: Variance-aware planning weight (`_placement_weight`)
+### Step 0: Variance-aware planning weight (`_placement_weight`)
 
 The input `hotness` is a rolling window of per-expert traffic, shape
 `[window, n_layers, n_experts]`. Two summaries are derived from it:
@@ -72,7 +94,7 @@ new regime is provisioned immediately. Layers that haven't shifted (and the enti
 stationary case) keep the exact uniform `mean + K*std`, so the refinement is zero-cost
 when nothing has changed.
 
-#### Step 1: One-time global placement (cycle 1 only)
+### Step 1: One-time global placement (cycle 1 only)
 
 This is a NumPy reimplementation of DeepSeek's EPLB, run once to get a strong
 starting layout, then aligned to the running table so the first move is cheap.
@@ -91,7 +113,7 @@ starting layout, then aligned to the running table so the first move is cheap.
    max-overlap), then experts already present are pinned to their slots and only the
    leftover slots are filled. Same balanced placement, far fewer experts in transit.
 
-#### Step 2: Bounded swap-maintenance (cycle 2+)
+### Step 2: Bounded swap-maintenance (cycle 2+)
 
 For every layer, ScalpeLB first tries to repair the _existing_ layout in place
 rather than rebuild it.
@@ -109,7 +131,7 @@ rather than rebuild it.
    drift in a single cycle, the trace is in a non-stationary / mixed regime where
    per-layer patching can't keep up, so _every_ layer is re-placed for that cycle.
 
-#### Coverage & safety
+### Coverage & safety
 
 Both swaps and re-placement only ever permute or recount experts that are already
 deployed, so every logical expert keeps at least one replica - `_layer_par` never
@@ -141,7 +163,7 @@ early in practice (~2 swaps); the default of 8 just leaves headroom for drift cy
 provably silent on stationary traces and fires only on genuine regime flips; set it
 above 1 to disable shift-gated recency entirely.
 
-### Tuning in production
+#### Tuning in production
 
 These five constants are deliberately exposed as `ScalpelBalancer` constructor
 arguments rather than buried in the algorithm. In a live hyperscale system (the kind
