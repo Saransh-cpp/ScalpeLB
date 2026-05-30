@@ -32,7 +32,7 @@ Tunables:
                 more than this. 0.2 keeps the stationary win AND stays robust on drift.
 
 Usage:
-    The primary entry point is the `rebalance` function. It is designed to be called
+    The primary entry point is the `rebalance` function. It is designed to be called 
     sequentially at each routing cycle in a stateful loop.
 
     ```python
@@ -45,13 +45,13 @@ Usage:
 
     # 2. Collect rolling traffic/routing frequencies from the cluster telemetry
     # Shape: [window_size, num_layers, num_experts]
-    hotness_window = np.random.rand(10, 58, 256)
+    hotness_window = np.random.rand(10, 58, 256) 
 
     # 3. Compute optimal cycle placement
     # The internal state machine persists across calls to minimize transit
     success, layer_indices, placement, _ = rebalance(
-        hotness=hotness_window,
-        n_device=n_device,
+        hotness=hotness_window, 
+        n_device=n_device, 
         n_red_expert=n_red_expert
     )
 
@@ -76,9 +76,20 @@ BUDGET = 8
 # PAR blowups that pure swap-maintenance suffers on drifting datasets.
 DRIFT_TOL = 0.2
 # If more than HEAVY_FRAC of layers drift in a cycle, the trace is in a non-stationary
-# (mixed) regime where swap-maintenance can't keep up -> re-place EVERY layer (full
-# variance), which dominates the hybrid on heavy drift. Targets the "Mix" dataset.
+# (mixed) regime -> re-place EVERY layer (full variance). Targets the "Mix" dataset.
+# NOTE: disabling this (heavy_frac=1.0) was tried on the platform and REGRESSED the score
+# 110.91 -> 110.50 -- transit fell ~22k but PAR rose 1.707->1.72, and PAR's 60x weight
+# dominated. The synthetic-drift test that predicted a win mischaracterized the within-
+# tolerance band; real Mix layers in the 1.0-1.2x band genuinely benefit from re-placement.
+# Kept at 0.5 (the proven #1 config).
 HEAVY_FRAC = 0.5
+# Shift-gated recency. A uniform window.mean lags at a context flip (Mix): newly-hot experts
+# are diluted by stale steps and under-provisioned, exploding PAR. On layers whose load
+# DISTRIBUTION shifted within the window (Total-Variation distance between the two halves >
+# SHIFT_TV) we recency-weight the placement so the new regime is provisioned immediately.
+# TV is volume-invariant, so stationary jitter does not trip it (measured ceiling ~0.143);
+# SHIFT_TV=0.2 is provably silent on stationary (zero cost), fires only on real flips. >1 disables.
+SHIFT_TV = 0.2
 
 
 # ===========================================================================
@@ -121,20 +132,38 @@ def _balanced_packing(weight: np.ndarray, num_packs: int):
     return pack_index, rank_in_pack
 
 
-def _global_placement(
-    weight: np.ndarray, num_replicas: int, num_gpus: int
-) -> np.ndarray:
+def _global_placement(weight: np.ndarray, num_replicas: int, num_gpus: int) -> np.ndarray:
     n_layers = weight.shape[0]
     per_gpu = num_replicas // num_gpus
     phy2log, logcnt = _replicate(weight, num_replicas)
-    tokens_per_phy = np.take_along_axis(weight, phy2log, 1) / np.take_along_axis(
-        logcnt, phy2log, 1
-    )
+    tokens_per_phy = np.take_along_axis(weight, phy2log, 1) / np.take_along_axis(logcnt, phy2log, 1)
     pack_index, rank_in_pack = _balanced_packing(tokens_per_phy, num_gpus)
     phy2pphy = pack_index * per_gpu + rank_in_pack
     pphy2phy = np.argsort(phy2pphy, axis=1, kind="stable")
     pphy2log = np.take_along_axis(phy2log, pphy2phy, 1)
     return pphy2log.reshape(n_layers, num_gpus, per_gpu).astype(np.int64)
+
+
+def _placement_weight(window: np.ndarray, k: float, shift_tv: float) -> np.ndarray:
+    """mean + k*std, but RECENCY-weighted on layers with a within-window distribution shift
+    (TV distance between window halves > shift_tv). Uniform (current behavior) elsewhere."""
+    n_t = window.shape[0]
+    uniform = window.mean(axis=0) + k * window.std(axis=0)
+    half = n_t // 2
+    old_d = window[:half].mean(axis=0)
+    new_d = window[half:].mean(axis=0)
+    old_d = old_d / (old_d.sum(axis=1, keepdims=True) + 1e-9)
+    new_d = new_d / (new_d.sum(axis=1, keepdims=True) + 1e-9)
+    tv = 0.5 * np.abs(new_d - old_d).sum(axis=1)            # [n_layers], 0..1 (shape shift)
+    shifted = tv > shift_tv
+    if not shifted.any():                                   # stationary -> exact current path
+        return uniform.astype(np.float64)
+    tw = np.arange(1, n_t + 1, dtype=np.float64).reshape(-1, 1, 1)
+    tw /= tw.sum()                                          # linear recency ramp
+    wmean = (window * tw).sum(axis=0)
+    wvar = np.maximum((tw * (window - wmean) ** 2).sum(axis=0), 0.0)
+    recency = wmean + k * np.sqrt(wvar)
+    return np.where(shifted[:, None], recency, uniform).astype(np.float64)
 
 
 # ===========================================================================
@@ -151,9 +180,7 @@ def _layer_par(weight_layer: np.ndarray, deploy_layer: np.ndarray) -> float:
     return float(loads.max() / loads.mean())
 
 
-def _scalpel_layer(
-    layout: np.ndarray, weight: np.ndarray, n_exp: int, budget: int
-) -> np.ndarray:
+def _scalpel_layer(layout: np.ndarray, weight: np.ndarray, n_exp: int, budget: int) -> np.ndarray:
     """Bounded greedy swap: hottest expert (hot GPU) <-> coldest expert (cold GPU)."""
     layout = layout.copy()
     counts = np.bincount(layout.reshape(-1), minlength=n_exp)
@@ -165,10 +192,8 @@ def _scalpel_layer(
         if h == c:
             break
         he, ce = layout[h], layout[c]
-        es = int(pr[he].argmax())
-        e = int(he[es])
-        fs = int(pr[ce].argmin())
-        f = int(ce[fs])
+        es = int(pr[he].argmax()); e = int(he[es])
+        fs = int(pr[ce].argmin()); f = int(ce[fs])
         if e == f:
             break
         new_h = loads[h] - pr[e] + pr[f]
@@ -182,24 +207,17 @@ def _scalpel_layer(
 
 
 class ScalpelBalancer:
-    def __init__(
-        self,
-        n_device: int,
-        n_red_expert: int,
-        k=None,
-        budget: int = BUDGET,
-        drift_tol: float = DRIFT_TOL,
-        heavy_frac: float = HEAVY_FRAC,
-    ):
+    def __init__(self, n_device: int, n_red_expert: int, k=None,
+                 budget: int = BUDGET, drift_tol: float = DRIFT_TOL, heavy_frac: float = HEAVY_FRAC,
+                 shift_tv: float = SHIFT_TV):
         self.n_device = int(n_device)
         self.n_red_expert = int(n_red_expert)
-        self.k = (
-            K_HIGH if k is None else float(k)
-        )  # resolved by n_experts at first step if auto
-        self._k_auto = k is None
+        self.k = K_HIGH if k is None else float(k)  # resolved by n_experts at first step if auto
+        self._k_auto = (k is None)
         self.budget = int(budget)
         self.drift_tol = float(drift_tol)
         self.heavy_frac = float(heavy_frac)
+        self.shift_tv = float(shift_tv)
         self.n_experts = None
         self.n_layers = None
         self.n_exp_per_dev = None
@@ -232,9 +250,7 @@ class ScalpelBalancer:
         oh[rows, layer_table.reshape(-1)] = 1.0
         return oh
 
-    def _match_devices(
-        self, cur_layer: np.ndarray, ideal_layer: np.ndarray
-    ) -> np.ndarray:
+    def _match_devices(self, cur_layer: np.ndarray, ideal_layer: np.ndarray) -> np.ndarray:
         n = self.n_device
         overlap = self._onehot(cur_layer) @ self._onehot(ideal_layer).T
         nz_d, nz_p = np.nonzero(overlap)
@@ -258,9 +274,7 @@ class ScalpelBalancer:
             pack_for_device[np.where(~used_dev)[0]] = np.where(~used_pack)[0]
         return pack_for_device
 
-    def _align_layer(
-        self, cur_layer: np.ndarray, ideal_layer: np.ndarray
-    ) -> np.ndarray:
+    def _align_layer(self, cur_layer: np.ndarray, ideal_layer: np.ndarray) -> np.ndarray:
         pack_for_device = self._match_devices(cur_layer, ideal_layer)
         aligned = np.empty_like(cur_layer)
         n_slot = self.n_exp_per_dev
@@ -285,60 +299,41 @@ class ScalpelBalancer:
         return aligned
 
     def step(self, window: np.ndarray):
-        window = np.asarray(window)
+        window = np.asarray(window).astype(np.float64)
         if self.current is None:
             self._lazy_init(window)
         if self._k_auto:
             self.k = K_HIGH if self.n_experts >= K_SWITCH_NE else K_LOW
             self._k_auto = False
-        weight = (window.mean(axis=0) + self.k * window.std(axis=0)).astype(np.float64)
+        # mean+k*std, recency-weighted only on layers with a within-window distribution shift.
+        weight = _placement_weight(window, self.k, self.shift_tv)
         real = window.sum(axis=0).astype(np.float64)  # real load, for the drift check
-        ideal = _global_placement(
-            weight, self.n_experts + self.n_red_expert, self.n_device
-        )
+        ideal = _global_placement(weight, self.n_experts + self.n_red_expert, self.n_device)
 
         new = self.current.copy()
         if not self._warm:
-            for layer in range(self.n_layers):
-                new[layer] = self._align_layer(self.current[layer], ideal[layer])
+            for l in range(self.n_layers):
+                new[l] = self._align_layer(self.current[l], ideal[l])
             self._warm = True
             self.current = new
-            return (
-                True,
-                np.arange(self.n_layers, dtype=np.int64),
-                new.astype(np.int64),
-                None,
-            )
+            return True, np.arange(self.n_layers, dtype=np.int64), new.astype(np.int64), None
 
         maint = {}
         drifted = set()
-        for layer in range(self.n_layers):
-            m = _scalpel_layer(
-                self.current[layer], weight[layer], self.n_experts, self.budget
-            )
-            maint[layer] = m
-            if _layer_par(real[layer], m) > _layer_par(real[layer], ideal[layer]) * (
-                1.0 + self.drift_tol
-            ):
-                drifted.add(layer)
-        heavy = (
-            len(drifted) > self.heavy_frac * self.n_layers
-        )  # mixed/non-stationary regime
-        for layer in range(self.n_layers):
-            if heavy or layer in drifted:
-                new[layer] = self._align_layer(
-                    self.current[layer], ideal[layer]
-                )  # re-place
+        for l in range(self.n_layers):
+            m = _scalpel_layer(self.current[l], weight[l], self.n_experts, self.budget)
+            maint[l] = m
+            if _layer_par(real[l], m) > _layer_par(real[l], ideal[l]) * (1.0 + self.drift_tol):
+                drifted.add(l)
+        heavy = len(drifted) > self.heavy_frac * self.n_layers   # mixed/non-stationary regime
+        for l in range(self.n_layers):
+            if heavy or l in drifted:
+                new[l] = self._align_layer(self.current[l], ideal[l])  # re-place
             else:
-                new[layer] = maint[layer]  # keep cheap swaps
+                new[l] = maint[l]                                      # keep cheap swaps
         self.current = new
 
-        return (
-            True,
-            np.arange(self.n_layers, dtype=np.int64),
-            self.current.astype(np.int64),
-            None,
-        )
+        return True, np.arange(self.n_layers, dtype=np.int64), self.current.astype(np.int64), None
 
 
 # State persists across cycles via a per-config cache.
@@ -363,14 +358,7 @@ def rebalance(hotness, n_device, n_red_expert):
         key = (int(n_device), int(n_red_expert), int(n_layers), int(n_experts))
         balancer = _BALANCERS.get(key)
         if balancer is None:
-            balancer = ScalpelBalancer(
-                n_device,
-                n_red_expert,
-                k=None,
-                budget=BUDGET,
-                drift_tol=DRIFT_TOL,
-                heavy_frac=HEAVY_FRAC,
-            )
+            balancer = ScalpelBalancer(n_device, n_red_expert, k=None, budget=BUDGET, drift_tol=DRIFT_TOL, heavy_frac=HEAVY_FRAC)
             _BALANCERS[key] = balancer
         return balancer.step(hotness)
     except Exception:

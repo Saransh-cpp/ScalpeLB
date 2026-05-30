@@ -15,7 +15,7 @@ algorithm to optimize the placement of experts on GPUs in terms of:
 - Transit: the number of experts that move to a different GPU
 
 Instead of recomputing the whole layout every cycle (and paying that transit every
-cycle), ScalpeLB establishs a good variance-aware placement ONCE, and then
+cycle), ScalpeLB establishes a good variance-aware placement ONCE, and then
 _maintains_ it with a small bounded number of surgical swaps per layer.
 
 - Cycle 1: variance-aware placement (mean + K\*std replication + balanced packing),
@@ -25,7 +25,7 @@ _maintains_ it with a small bounded number of surgical swaps per layer.
   PAR stays within DRIFT_TOL of a fresh variance placement; otherwise the layer
   has DRIFTED (frozen replica counts went stale) -> re-place it fully.
 
-The full-repack (EBLP) approach re-pays the entire placement transit every cycle
+The full-repack (EPLB) approach re-pays the entire placement transit every cycle
 and its greedy packer churns even stable experts. ScalpeLB pays placement once and
 only moves what reduces the max load -> far less transit, PAR no worse (often better).
 The drift guard is essential: pure swap-maintenance freezes replica counts, which blows
@@ -33,13 +33,120 @@ up PAR on non-stationary / mixed traces (a newly-hot expert can't get more copie
 per-layer re-place fixes that while keeping low transit on the stable majority. Swaps and
 re-placement both preserve coverage -> no NaN-PAR risk.
 
+### The algorithm, step by step
+
+The state machine runs once per routing cycle. Cycle 1 builds a placement from
+scratch; every cycle after that tries to _keep_ that placement and only repairs the
+layers that have gone stale. Each numbered step below maps to a function in
+[scalpelb.py](scalpelb.py).
+
+#### Step 0: Variance-aware weight (`step`)
+
+The input `hotness` is a rolling window of per-expert traffic, shape
+`[window, n_layers, n_experts]`. Two summaries are derived from it:
+
+- `weight = mean(window) + K * std(window)`: the **planning** signal. Adding
+  `K * std` over-provisions experts whose load is _spiky_, not just high on average,
+  so a bursty expert gets extra replicas before it melts a GPU.
+- `real = sum(window)`: the **measurement** signal (raw observed load), used only
+  to score placements in the drift check so the guard reacts to what actually
+  happened, not to the hedged estimate.
+
+`K` is auto-selected by expert count: variance hedging helps high-count models
+(`K = 2.0` for `n_experts >= 192`, e.g. DeepSeek-R1's 256) but hurts low-count,
+more-uniform models (`K = 0.0` for Qwen3-style 128), where it scored worse than
+plain mean.
+
+#### Step 1: One-time global placement (cycle 1 only)
+
+This is a NumPy reimplementation of DeepSeek's EPLB, run once to get a strong
+starting layout, then aligned to the running table so the first move is cheap.
+
+1. **Replication** (`_replicate`): start with one physical slot per logical expert,
+   then hand out the remaining redundant slots greedily, such that each goes to the expert
+   with the highest _per-replica_ load (`weight / current_replica_count`). Hot
+   experts accumulate copies; the load each copy carries shrinks as copies are added.
+2. **Balanced packing** (`_balanced_packing`): sort all physical replicas by load
+   (descending) and drop each into the lightest GPU that still has a free slot. This
+   is a longest-processing-time bin-packing heuristic that levels the per-GPU totals.
+3. **Minimal-transit alignment** (`_match_devices` + `_align_layer`): the ideal
+   layout above is a _set_ of experts per GPU; their physical slot positions are
+   arbitrary. To avoid moving experts that are already in the right place, each
+   current GPU is matched to the ideal pack it overlaps with most (greedy
+   max-overlap), then experts already present are pinned to their slots and only the
+   leftover slots are filled. Same balanced placement, far fewer experts in transit.
+
+#### Step 2: Bounded swap-maintenance (cycle 2+)
+
+For every layer, ScalpeLB first tries to repair the _existing_ layout in place
+rather than rebuild it.
+
+1. **Scalpel swap** (`_scalpel_layer`): up to `BUDGET` times, find the hottest and
+   coldest GPU, and swap that GPU pair's hottest and coldest expert, but only if the
+   swap strictly lowers the peak load. It stops early the moment no swap helps
+   (usually after ~2 swaps), so the transit cost is tiny and bounded.
+2. **Drift guard** (`_layer_par`): replica _counts_ are frozen during swaps, so a
+   newly-hot expert can't get more copies. A layer is flagged **drifted** when its
+   maintained PAR exceeds a fresh placement's PAR by more than `DRIFT_TOL`. Drifted
+   layers are re-placed via Step 1's alignment (new replica counts); everyone else
+   keeps the cheap swaps.
+3. **Heavy-drift escape hatch** (`HEAVY_FRAC`): if more than `HEAVY_FRAC` of layers
+   drift in a single cycle, the trace is in a non-stationary / mixed regime where
+   per-layer patching can't keep up, so _every_ layer is re-placed for that cycle.
+
+#### Coverage & safety
+
+Both swaps and re-placement only ever permute or recount experts that are already
+deployed, so every logical expert keeps at least one replica - `_layer_par` never
+divides by zero and PAR never goes NaN. `rebalance` also wraps the whole step in a
+try/except that returns a trivially valid round-robin layout (`_safe_fallback`) if
+anything throws, so a single bad cycle can never crash the serving loop.
+
 ### Parameters
 
-- K: variance weight for replication/placement (mean + K\*std). ~1-2.5.
-- BUDGET: max swaps per layer per cycle (transit ceiling). Converges early (~2);
-  8 leaves headroom for drift.
-- DRIFT_TOL: re-place a layer when its maintained PAR exceeds a fresh placement's by
-  more than this. 0.2 keeps the stationary win AND stays robust on drift.
+ScalpeLB has four knobs. Each trades off the two competing objectives - **PAR**
+(balance quality) against **Transit** (experts moved). The defaults below were found
+by an offline grid sweep over the competition traces (the value in each grid cell
+scored by PAR and transit), so they are the best static operating point for _those_
+traces; the next section covers how a production system would set them dynamically
+instead.
+
+| Parameter    | What it controls                                                                                            | Default          | Turn it **up** when…                                           | Turn it **down** when…                                          |
+| ------------ | ----------------------------------------------------------------------------------------------------------- | ---------------- | -------------------------------------------------------------- | --------------------------------------------------------------- |
+| `K`          | Variance buffer in the planning weight `mean + K*std`; controls how aggressively spiky experts are over-replicated. | auto (2.0 / 0.0) | Traffic is bursty/chaotic and you have spare replica slots.    | Traffic is smooth/uniform, or redundant slots are scarce.       |
+| `BUDGET`     | Max swaps per layer per cycle; the hard ceiling on transit.                                                | 8                | Interconnect is idle; you want the tightest possible balance.  | Interconnect is congested; minimize experts in flight.          |
+| `DRIFT_TOL`  | How far a maintained layer's PAR may exceed a fresh placement's before it's re-placed.                      | 0.2              | You favor stability/low transit over chasing every PAR gain.   | You need PAR held tight and can afford the extra re-placements. |
+| `HEAVY_FRAC` | Fraction of drifted layers that triggers a full re-place of every layer that cycle.                         | 0.5              | Drift is usually localized; keep patching as long as possible. | Traffic shifts globally; bail to a full rebuild sooner.         |
+
+`K` is auto-selected from `n_experts` (`K_HIGH = 2.0` at or above `K_SWITCH_NE = 192`,
+`K_LOW = 0.0` below) unless passed explicitly to `ScalpelBalancer`. `BUDGET` converges
+early in practice (~2 swaps); the default of 8 just leaves headroom for drift cycles.
+
+### Tuning in production
+
+These four constants are deliberately exposed as `ScalpelBalancer` constructor
+arguments rather than buried in the algorithm. In a live hyperscale system (the kind
+of infrastructure serving DeepSeek-R1 or GPT-4) they would **not** be static. They
+are exactly the surface a telemetry-driven control plane tunes online. ScalpeLB
+already ships a primitive version of this: `K` is auto-selected from the model's
+expert count. A full controller would go further, recomputing the knobs per window
+from live signals:
+
+- **Dynamic `K` (variance buffer).** A background service watches the burstiness of
+  the last few minutes of routing traffic (the same `hotness` stream the balancer
+  consumes). Chaotic, spiking query mixes dial `K` **up** to pre-provision hot experts
+  before they melt a GPU; smooth traffic dials it **down** to reclaim scarce replica
+  slots.
+- **Dynamic `BUDGET` (transit ceiling).** The controller reads interconnect health.
+  When the GPU fabric is congested by other workloads it lowers `BUDGET` to 1–2 swaps
+  so rebalancing doesn't compete for bandwidth; when the fabric is idle it raises it
+  (~10) to balance compute as tightly as possible.
+- **`DRIFT_TOL` / `HEAVY_FRAC` (SLA / churn).** These map naturally onto a serving
+  SLA: tighten them when the deployment must hold a strict tail-latency target, loosen
+  them to prioritize layout stability and minimize migration churn.
+
+In other words, the static defaults in this repo are best understood as a single
+hand-tuned operating point of a control loop that, in production, would be closed.
 
 ## Usage
 
@@ -68,6 +175,34 @@ success, layer_indices, placement, _ = rebalance(
 
 # `placement` shape: [num_layers, num_gpus, experts_per_gpu]
 ```
+
+## Future work
+
+The four knobs are currently set by an **offline grid sweep** over the competition
+traces, which was exhaustive, static, and tied to the traces it was run on. The "Tuning in
+production" section above describes the first step beyond that: a control plane that
+sets the knobs from live telemetry instead of a frozen sweep result. The natural next
+step is to make that loop **learned** rather than hand-engineered: instead of either a
+grid sweep or hand-written telemetry → knob rules, train a small controller (telemetry
+features → `K`, `BUDGET`, `DRIFT_TOL`, `HEAVY_FRAC`) by gradient descent on a
+`PAR + λ * Transit` objective measured over incoming traffic.
+
+The obstacle is that the current pipeline is **non-differentiable**; hence, replication,
+balanced packing, and the scalpel swaps are all built from `argmax` / `argsort` /
+greedy selection, which have no usable gradient. Making the objective differentiable
+end-to-end would require relaxing those discrete steps, e.g.:
+
+- soft, temperature-controlled assignment (softmax / Gumbel-softmax) in place of the
+  hard `argmax` replication and swap choices;
+- a Sinkhorn / optimal-transport relaxation of the balanced-packing assignment;
+- straight-through estimators so the forward pass stays discrete (and valid) while
+  gradients still flow to the controller.
+
+With a differentiable surrogate of PAR/Transit, the knobs, or a controller network
+predicting them per window, could be trained online against the live `hotness`
+stream, closing the loop the production section only sketches. This is exploratory and
+not implemented; the shipped algorithm remains the discrete, deterministic version
+documented above.
 
 ## License
 
